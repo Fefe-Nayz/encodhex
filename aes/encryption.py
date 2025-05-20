@@ -1,6 +1,81 @@
 # AES 256
+from .key import key_expansion
 
-# 14 tours
+# Chiffrement AES 256 (ECB)
+# Chiffre un texte en clair avec une clé AES 256 bits
+def encrypt(plaintext: str, key: str, encoding = "hex") -> str:
+    # Gestion de la clé
+
+    # Convertir la clé en octets
+    key_bytes = key.encode()
+
+    # Vérifier la longueur de la clé
+    if len(key) != 32:
+        raise ValueError("La clé doit être de 32 octets (256 bits).")
+
+    # Générer les clés de ronde avec l'algorithme d'expansion de clé
+    round_keys = key_expansion(key_bytes)
+
+    # Gestion du texte en clair
+
+    # Convertir le texte en clair en octets
+    plaintext_bytes = plaintext.encode()
+
+    # Compléter le texte en clair pour qu'il soit un multiple de 16
+    padding_length = 16 - (len(plaintext_bytes) % 16)
+    plaintext_bytes += bytes([padding_length] * padding_length)
+
+    # Diviser le texte en blocs de 16 octets
+    blocks = divide_blocks(plaintext_bytes)
+
+    # Chiffrement de chaque bloc de 16 octets
+    encrypted_blocks = []
+    for block in blocks:
+        # Transformer le bloc en matrice 4x4
+        # Les 4 premiers octets forment la première colonne, les 4 suivants la deuxième, etc.
+        mat = transform_block_to_matrix(block)
+
+        print("Plain Block Matrix", mat)
+
+        # Round initial
+        add_round_key(mat, round_keys[0])
+        
+        # 14 rounds
+        for n in range(1, 14):
+            substitute_bytes(mat)
+            shift_rows(mat)
+            mix_columns(mat)
+            add_round_key(mat, round_keys[n])
+        
+        # Round final sans mix columns
+        substitute_bytes(mat)
+        shift_rows(mat)
+        add_round_key(mat, round_keys[14])
+
+        print("Final State", mat)
+
+        # Récupérer les octects chiffrés de la matrice
+        encrypted_bytes = bytes(mat[i][j] for j in range(4) for i in range(4))
+        print("Encrypted Block", encrypted_bytes)
+
+        # Ajouter le bloc chiffré à la liste des blocs chiffrés
+        encrypted_blocks.append(encrypted_bytes)
+
+    # Joindre tous les blocs chiffrés
+    encrypted_bytes = b''.join(encrypted_blocks)
+
+    # Gestion de texte chiffré
+    encrypted_text = ""
+
+    if encoding == "hex":
+        # Encoder les blocs chiffrés en hexadécimal
+        encrypted_text = encrypted_bytes.hex()
+    elif encoding == "base64":
+        import base64
+        # Encoder les blocs chiffrés en base64
+        encrypted_text = base64.b64encode(encrypted_bytes).decode()
+    
+    return encrypted_text
 
 # Table de substitution S-Box
 S_BOX = [
@@ -41,34 +116,17 @@ INV_S_BOX = [
         [0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d]
 ]
 
-# Clé 256bits
-key = ""
-
-plain_text = "12345678abcdefg"
-
-print("Plain Text", plain_text)
-
-# Récupérer le texte plain en octets
-plain_bytes = plain_text.encode()
-
-# Compléter pour que la longueur soit un multiple de 16
-padding_length = 16 - (len(plain_bytes) % 16)
-plain_bytes += bytes([padding_length] * padding_length)
-
-print("Plain bytes", plain_bytes)
-
-# Diviser en blocs de 16 octets
-blocks = []
-
-for i in range(0, len(plain_bytes), 16):
-    # Prendre les octets de i à i+16
-    block = plain_bytes[i:i + 16]
-    blocks.append(block)
-
-print("Blocks", blocks)
+def divide_blocks(plain_bytes):
+    # Diviser le texte en blocs de 16 octets
+    blocks = []
+    for i in range(0, len(plain_bytes), 16):
+        # Prendre les octets de i à i+16
+        block = plain_bytes[i:i + 16]
+        blocks.append(block)
+    return blocks
 
 # Transformation des blocs en matrices 4x4
-# Chaque bloc de 16 octets est une matrice 4x4 l'octet 5 correspond à l'element (2, 1)
+# Les 4 premiers octets forment la première colonne, les 4 suivants la deuxième, etc.
 def transform_block_to_matrix(block):
     mat = [
         [0, 0, 0, 0],
@@ -77,79 +135,37 @@ def transform_block_to_matrix(block):
         [0, 0, 0, 0]
     ]
 
-    # Ligne
+    # AES utilise un ordre par colonnes, pas par lignes
     for i in range(4):
-        # Colonne
         for j in range(4):
-            mat[i][j] = block[i*4 + j]
-
+            mat[i][j] = block[j*4 + i]
     return mat
 
-
-mats = []
-
-for block in blocks:
-    mat = transform_block_to_matrix(block)
-    mats.append(mat)
-
-
-print("Matrices", mats)
-
-# Subsitution des octets
-
-# Substitution d'un octet avec la S-Box
-# TODO: A vérifier
-def substitute_byte(byte):
-    row = (byte >> 4) & 0x0F  # Partie haute (4 bits de gauche) = ligne
-    col = byte & 0x0F         # Partie basse (4 bits de droite) = colonne
-    return S_BOX[row][col]
-
-sub_mats = []
-
-for mat in mats:
-    sub_mat = [
-        [0, 0, 0, 0],
-        [0, 0, 0, 0],
-        [0, 0, 0, 0],
-        [0, 0, 0, 0]
-    ]
+def substitute_bytes(mat):
     for i in range(4):
         for j in range(4):
-            sub_byte = substitute_byte(mat[i][j])
-            sub_mat[i][j] = sub_byte
-    sub_mats.append(sub_mat)
+            byte = mat[i][j]
 
-print("Substituted Matrices", sub_mats)
+            row = (byte >> 4) & 0x0F  # Partie haute (4 bits de gauche) = ligne
+            col = byte & 0x0F         # Partie basse (4 bits de droite) = colonne
 
-# Shift rows
-# Décalage des lignes vers la gauche
+            sub_byte = S_BOX[row][col]
+
+            mat[i][j] = sub_byte
+
+# Décaler une ligne vers la gauche de n positions
+def shift_row(row, n):
+    return row[n:] + row[:n]
+
+# Décalage de toutes les lignes d'une matrice vers la gauche
 # La première ligne ne bouge pas
 # La deuxième ligne est décalée de 1 vers la gauche
 # La troisième ligne est décalée de 2 vers la gauche
 # La quatrième ligne est décalée de 3 vers la gauche
-
-def shift_row(row, shift):
-    return row[shift:] + row[:shift]
-
-shifted_mats = []
-
-for sub_mat in sub_mats:
-    shifted_mat = [
-        [0, 0, 0, 0],
-        [0, 0, 0, 0],
-        [0, 0, 0, 0],
-        [0, 0, 0, 0]
-    ]
-
+def shift_rows(mat):
     for i in range(4):
-        shifted_mat[i] = shift_row(sub_mat[i], i)
-
-    shifted_mats.append(shifted_mat)
-
-print("Shifted Matrices", shifted_mats)
-
-# Mix columns
-# On multiplie chaque colonne par la matrice de mélange
+        # Décalage de la ligne i vers la gauche de i positions
+        mat[i] = shift_row(mat[i], i)
 
 MIX_MATRIX = [
     [2, 3, 1, 1],
@@ -171,12 +187,13 @@ def galois_multiply(a, b):
         b >>= 1  # Décalage à droite
     return p & 0xFF  # Retourner les 8 bits de poids faible
 
-# MixColumns pour une seule colonne
+# Multiplier une colonne par la matrice de mixage dans GF(2^8)
 def mix_single_column(column):
     a = column[0]
     b = column[1]
     c = column[2]
     d = column[3]
+
     return [
         galois_multiply(a, 2) ^ galois_multiply(b, 3) ^ c ^ d,
         a ^ galois_multiply(b, 2) ^ galois_multiply(c, 3) ^ d,
@@ -184,19 +201,16 @@ def mix_single_column(column):
         galois_multiply(a, 3) ^ b ^ c ^ galois_multiply(d, 2)
     ]
 
-# MixColumns pour une matrice entière
+# Multiplier chaque colonne de la matrice par la matrice de mixage
 def mix_columns(matrix):
     for i in range(4):  # Pour chaque colonne
         column = [matrix[j][i] for j in range(4)]  # Extraire la colonne
         mixed_column = mix_single_column(column)  # Appliquer MixColumns
         for j in range(4):
             matrix[j][i] = mixed_column[j]  # Remettre la colonne dans la matrice
-    return matrix
 
-mixed_mats = []
-
-for shifted_mat in shifted_mats:
-    mixed_mat = mix_columns(shifted_mat)
-    mixed_mats.append(mixed_mat)
-
-print("Mixed Matrices", mixed_mats)
+# Ajouter la clé de ronde
+def add_round_key(mat, round_key):
+    for i in range(4):
+        for j in range(4):
+            mat[i][j] = mat[i][j] ^ round_key[i][j]

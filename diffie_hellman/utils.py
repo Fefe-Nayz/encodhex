@@ -1,4 +1,6 @@
 import secrets
+import hashlib
+import base64
 
 # Tester si un nombre est premier
 def is_probable_prime(n, k=20):
@@ -56,7 +58,8 @@ def generate_public_key(p, g, a):
 
 # Calculer la clé finale
 def compute_shared_key(p, other_public, private_key):
-    return pow(other_public, private_key, p)
+    K = pow(other_public, private_key, p)
+    return normalize_key_256(K)
 
 # Générer les paramètres
 def generate_parameters(bits=256):
@@ -64,3 +67,15 @@ def generate_parameters(bits=256):
     g = generate_generator(p, q)
     return (p, g)
 
+def normalize_key_256(shared_key):
+    """
+    Normalise la clé partagée en une chaîne de 32 caractères pour AES-256
+    """
+    # Conversion en bytes
+    shared_bytes = shared_key.to_bytes((shared_key.bit_length() + 7) // 8, byteorder="big")
+    
+    # Hasher pour obtenir une distribution uniforme
+    hash_bytes = hashlib.sha256(shared_bytes).digest()
+    
+    # Prendre les 16 premiers octets du hash et les convertir en 32 caractères hex
+    return hash_bytes[:16].hex()  # 16 bytes = 32 caractères hex = 128 bits
