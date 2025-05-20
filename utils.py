@@ -58,7 +58,9 @@ def generate_public_key(p, g, a):
 def compute_shared_key(p, other_public, private_key):
     return pow(other_public, private_key, p)
 
+# Générer les paramètres
 def generate_parameters(bits=256):
     (p, q) = generate_safe_prime(bits)
     g = generate_generator(p, q)
     return (p, g)
+
