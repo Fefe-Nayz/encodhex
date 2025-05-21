@@ -1,4 +1,4 @@
-from diffie_hellman.utils import (
+from diffie_hellman.diffie_hellman import (
     generate_parameters, generate_private_key, generate_public_key, 
     compute_shared_key
 )

@@ -4,7 +4,8 @@ import socket
 import json
 import sys
 from datetime import datetime
-from utils import generate_parameters, generate_private_key, generate_public_key, compute_shared_key
+from aes.encryption import encrypt
+from diffie_hellman.diffie_hellman import generate_parameters, generate_private_key, generate_public_key, compute_shared_key
 
 # Variables globales pour gérer l'état de la connexion
 active_connections = {}  # Dictionnaire pour stocker les connexions actives

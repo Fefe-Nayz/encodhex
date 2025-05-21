@@ -15,7 +15,8 @@ from textual.reactive import reactive
 from rich.text import Text
 from rich.panel import Panel
 from textual.binding import Binding
-from utils import (
+from aes.encryption import encrypt
+from diffie_hellman.diffie_hellman import (
     generate_parameters,
     generate_private_key,
     generate_public_key,
