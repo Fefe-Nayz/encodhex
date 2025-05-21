@@ -4,7 +4,7 @@ import socket
 import json
 import sys
 from datetime import datetime
-from aes.encryption import encrypt
+from aes.encryption import encrypt, decrypt
 from diffie_hellman.diffie_hellman import generate_parameters, generate_private_key, generate_public_key, compute_shared_key
 
 # Variables globales pour gérer l'état de la connexion
@@ -94,7 +94,7 @@ async def send_message(uri, message_text):
             await ws.send(json.dumps({
                 "type": "text",
                 "sender": username,
-                "message": message_text,
+                "message": encrypt(message_text, shared_key),
                 "timestamp": timestamp,
                 "sender_port": port
             }))
@@ -104,7 +104,7 @@ async def send_message(uri, message_text):
                 response = await ws.recv()
                 data = json.loads(response)
                 if data.get("type") != "ack":  # Si ce n'est pas une confirmation
-                    console_print(f"[{data['timestamp']}] {data['sender']}: {data['message']}")
+                    console_print(f"[{data['timestamp']}] {data['sender']}: {decrypt(data['message'], shared_key)}")
             except Exception as e:
                 # Ignorer les erreurs de réception - le message a peut-être été envoyé malgré tout
                 pass
@@ -188,7 +188,7 @@ async def handle_connection(websocket):
                 # ───────── texte ─────────
                 else:
                     # C'est un message texte normal
-                    formatted_message = f"[{timestamp}] {data['sender']}: {data['message']}" 
+                    formatted_message = f"[{timestamp}] {data['sender']}: {decrypt(data['message'], shared_key)}" 
                     console_print(formatted_message)
                 
                 # Traiter les informations de l'expéditeur si disponibles
