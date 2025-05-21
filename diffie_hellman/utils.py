@@ -68,9 +68,6 @@ def generate_parameters(bits=256):
     return (p, g)
 
 def normalize_key_256(shared_key):
-    """
-    Normalise la clé partagée en une chaîne de 32 caractères pour AES-256
-    """
     # Conversion en bytes
     shared_bytes = shared_key.to_bytes((shared_key.bit_length() + 7) // 8, byteorder="big")
     

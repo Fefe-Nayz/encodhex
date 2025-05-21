@@ -2,7 +2,7 @@ from diffie_hellman.utils import (
     generate_parameters, generate_private_key, generate_public_key, 
     compute_shared_key
 )
-from aes.encryption import encrypt
+from aes.encryption import encrypt, decrypt
 
 # Générer les paramètres DH
 (p, q) = generate_parameters()
@@ -25,3 +25,7 @@ plaintext = "Hello, World!"
 encrypted_text = encrypt(plaintext, shared_key_a)
 
 print(f"Encrypted Text: {encrypted_text}")
+
+decrypted_text = decrypt(encrypted_text, shared_key_a)
+
+print(f"Decrypted Text: {decrypted_text}")
