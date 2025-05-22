@@ -12,7 +12,7 @@ Chiffrement des messages en utilisant [AES-256](https://fr.wikipedia.org/wiki/Ad
 
 Les algorithmes de chiffrements ont été implémenté de zéro.
 
-**Ne pas utiliser dans une véritable projet.**
+**Ne pas utiliser dans un véritable projet.**
 
 ## Démonstration
 
