@@ -1,0 +1,32 @@
+{
+  "Réseau Local": {
+    "name": "Réseau Local",
+    "contacts": [
+      "Alice",
+      "Bob",
+      "Charlie"
+    ],
+    "created": "2025-05-24T12:28:41.951703",
+    "description": "Groupe pour le réseau local 192.168.1.x"
+  },
+  "Équipe Alpha": {
+    "name": "Équipe Alpha",
+    "contacts": [
+      "Alice",
+      "David"
+    ],
+    "created": "2025-05-24T12:28:41.951710",
+    "description": "Équipe Alpha - contacts prioritaires"
+  },
+  "Tous": {
+    "name": "Tous",
+    "contacts": [
+      "Alice",
+      "Bob",
+      "Charlie",
+      "David"
+    ],
+    "created": "2025-05-24T12:28:41.951711",
+    "description": "Groupe avec tous les contacts"
+  }
+}
