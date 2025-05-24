@@ -487,12 +487,6 @@ class ChatInput(Input):
     
     inherit_bindings = True  # Let the footer merge app bindings
     
-    # Re-declare the key that clashes with built-in Input bindings,
-    # mark it high-priority so it wins the clash and shows in footer
-    BINDINGS = [
-        Binding("ctrl+k", "manage_contacts", "👥 Contacts", priority=True, show=True),
-    ]
-    
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
