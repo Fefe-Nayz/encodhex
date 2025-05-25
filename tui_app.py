@@ -27,6 +27,8 @@ from rich.text import Text
 from rich.panel import Panel
 from textual.binding import Binding
 from textual.message import Message
+import mimetypes
+mimetypes.add_type("image/svg+xml", ".svg")
 from PIL import Image, ImageOps
 from rich_pixels import Pixels
 # from textual_slider import Slider  # Not available, use regular Input instead
@@ -37,6 +39,7 @@ from diffie_hellman.diffie_hellman import (
     generate_public_key,
     compute_shared_key,
 )
+from textual_filedrop import FileDrop, getfiles
 
 # ──────────────────────────── Data Classes ────────────────────────────
 @dataclass
@@ -441,43 +444,70 @@ def is_image_file(filename: str) -> bool:
     """Check if file is an image."""
     return filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.svg'))
 
-async def process_image_for_display_async(image_path: str) -> Union[Pixels, str]:
-    """Convert an image to Rich Pixels for PREVIEW (smaller size)."""
+async def process_image_for_display_async(image_path: str) -> Union[Pixels, str, List[Pixels]]:
+    """Process image for display in chat, handling both static images and animated GIFs."""
     def _process_image():
         try:
-            # Validate file size first
-            if os.path.getsize(image_path) > app_state.max_file_size:
-                return f"[Image trop volumineuse (max {format_file_size(app_state.max_file_size)})]"
-            
-            # Get preview dimensions (smaller than before)
-            max_width, max_height = app_state.get_image_dimensions()
-            
-            # Open and process image
             with Image.open(image_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # Calculate new size maintaining aspect ratio
-                img_width, img_height = img.size
-                aspect_ratio = img_width / img_height
-                
-                if aspect_ratio > max_width / max_height:
-                    new_width = max_width
-                    new_height = int(new_width / aspect_ratio)
+                # Check if it's an animated GIF
+                if hasattr(img, 'is_animated') and img.is_animated:
+                    # Process GIF frames
+                    frames = []
+                    frame_count = getattr(img, 'n_frames', 1)
+                    
+                    # Limit frames for performance
+                    max_frames = min(frame_count, 10)
+                    
+                    for frame_num in range(max_frames):
+                        img.seek(frame_num)
+                        frame = img.copy()
+                        if frame.mode != 'RGB':
+                            frame = frame.convert('RGB')
+                        
+                        # Get chat display dimensions
+                        width, height = app_state.get_image_dimensions()
+                        
+                        # Resize frame maintaining aspect ratio
+                        img_width, img_height = frame.size
+                        aspect_ratio = img_width / img_height
+                        
+                        if aspect_ratio > width / height:
+                            new_width = width
+                            new_height = int(new_width / aspect_ratio)
+                        else:
+                            new_height = height
+                            new_width = int(new_height * aspect_ratio)
+                        
+                        resized_frame = frame.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        frames.append(Pixels.from_image(resized_frame))
+                    
+                    return frames
                 else:
-                    new_height = max_height
-                    new_width = int(new_height * aspect_ratio)
-                
-                new_width = max(30, new_width)
-                new_height = max(15, new_height)
-                
-                resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                pixels = Pixels.from_image(resized_img)
-                return pixels
-                
+                    # Process static image
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    
+                    # Get chat display dimensions
+                    width, height = app_state.get_image_dimensions()
+                    
+                    # Resize maintaining aspect ratio
+                    img_width, img_height = img.size
+                    aspect_ratio = img_width / img_height
+                    
+                    if aspect_ratio > width / height:
+                        new_width = width
+                        new_height = int(new_width / aspect_ratio)
+                    else:
+                        new_height = height
+                        new_width = int(new_height * aspect_ratio)
+                    
+                    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    return Pixels.from_image(resized_img)
+                    
         except Exception as e:
-            return f"[Erreur d'affichage: {e}]"
+            return f"❌ Erreur de traitement d'image: {e}"
     
+    # Run in thread pool to avoid blocking
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _process_image)
 
@@ -498,49 +528,165 @@ class UniversalDirectoryTree(DirectoryTree):
         return list(paths)  # Show everything
 
 # ────────────────────────────── Modal Screens ──────────────────────────
-class FilteredDirectoryTree(DirectoryTree):
-    """Enhanced DirectoryTree with search and filter capabilities."""
-    
-    def __init__(self, path, search_term="", image_filter=False, **kwargs):
+class SearchableDirectoryTree(DirectoryTree):
+    """DirectoryTree with fast search through visible/expanded items only."""
+
+    search_term = reactive("")
+    images_only = reactive(False)
+    show_hidden = reactive(False)
+
+    def __init__(
+        self,
+        path,
+        *,
+        search: str = "",
+        images_only: bool = False,
+        show_hidden: bool = False,
+        **kwargs,
+    ):
+        # Ensure we start with a valid path
+        if not path or not os.path.exists(path):
+            path = os.getcwd()
         super().__init__(path, **kwargs)
-        self.search_term = search_term.lower()
-        self.image_filter = image_filter
-    
-    def filter_paths(self, paths):
-        """Filter paths based on search term and image filter."""
-        filtered = []
+        self.search_term = search
+        self.images_only = images_only
+        self.show_hidden = show_hidden
+        self._search_timer = None
+        self._pending_filters = {}
+
+    def set_filters(
+        self,
+        *,
+        search: str | None = None,
+        images_only: bool | None = None,
+        show_hidden: bool | None = None,
+    ) -> None:
+        """Change any filter with debouncing to prevent rapid reloads."""
+        # Store the pending filter changes
+        if search is not None:
+            self._pending_filters['search'] = search
+        if images_only is not None:
+            self._pending_filters['images_only'] = images_only
+        if show_hidden is not None:
+            self._pending_filters['show_hidden'] = show_hidden
         
-        for path in paths:
-            # Always show directories for navigation
-            if path.is_dir():
-                # Apply search filter to directory names
-                if not self.search_term or self.search_term in path.name.lower():
-                    filtered.append(path)
-            else:
-                # For files, apply both search and image filters
-                include_file = True
-                
-                # Search filter
-                if self.search_term and self.search_term not in path.name.lower():
-                    include_file = False
-                
-                # Image filter
-                if self.image_filter and not is_image_file(path.name):
-                    include_file = False
-                
-                if include_file:
-                    filtered.append(path)
+        # Cancel any existing timer
+        if self._search_timer is not None:
+            self._search_timer.stop()
         
-        return filtered
-    
-    def update_filters(self, search_term="", image_filter=False):
-        """Update search and filter settings and refresh the tree."""
-        self.search_term = search_term.lower()
-        self.image_filter = image_filter
+        # For non-search filters (images_only, show_hidden), apply immediately
+        # Only debounce search input since that's what users type rapidly
+        if search is None and (images_only is not None or show_hidden is not None):
+            self._apply_pending_filters()
+        else:
+            # Start a new timer for search input (0.5 second delay for responsiveness)
+            self._search_timer = self.set_timer(0.5, self._apply_pending_filters)
+
+    def _apply_pending_filters(self) -> None:
+        """Apply all pending filter changes."""
+        # Apply the stored filter values
+        if 'search' in self._pending_filters:
+            self.search_term = self._pending_filters['search']
+        if 'images_only' in self._pending_filters:
+            self.images_only = self._pending_filters['images_only']
+        if 'show_hidden' in self._pending_filters:
+            self.show_hidden = self._pending_filters['show_hidden']
+        
+        # Clear pending filters
+        self._pending_filters.clear()
+        self._search_timer = None
+        
+        # Now apply the filters
+        self._force_full_reload()
+
+    def _force_full_reload(self) -> None:
+        """Force a complete reload of the tree including all expanded nodes."""
+        # Store the current expanded state
+        expanded_paths = self._get_expanded_paths()
+        
+        # Reload the entire tree
         self.reload()
+        
+        # Restore the expanded state after a short delay
+        self.call_later(lambda: self._restore_expanded_state(expanded_paths))
+    
+    def _get_expanded_paths(self) -> set[str]:
+        """Get the paths of all currently expanded directories."""
+        expanded = set()
+        
+        def collect_expanded(node):
+            if hasattr(node, 'is_expanded') and node.is_expanded and hasattr(node, 'data') and node.data:
+                try:
+                    expanded.add(str(node.data.path))
+                except Exception:
+                    pass
+            if hasattr(node, 'children'):
+                for child in node.children:
+                    collect_expanded(child)
+        
+        if hasattr(self, 'root') and self.root:
+            collect_expanded(self.root)
+        
+        return expanded
+    
+    def _restore_expanded_state(self, expanded_paths: set[str]) -> None:
+        """Restore the expanded state of directories."""
+        def expand_matching(node):
+            if hasattr(node, 'data') and node.data:
+                try:
+                    if str(node.data.path) in expanded_paths:
+                        node.expand()
+                except Exception:
+                    pass
+            if hasattr(node, 'children'):
+                for child in node.children:
+                    expand_matching(child)
+        
+        if hasattr(self, 'root') and self.root:
+            expand_matching(self.root)
+
+    def filter_paths(self, paths):
+        """Filter only the immediate children paths (visible items only)."""
+        search = self.search_term.strip()
+        img_only = self.images_only
+        show_hidden = self.show_hidden
+        filtered = []
+
+        for path in paths:
+            name = path.name
+
+            # Skip hidden files/folders unless show_hidden is enabled
+            if not show_hidden and name.startswith("."):
+                continue
+
+            is_file = path.is_file()
+            is_dir = path.is_dir()
+
+            # Handle files
+            if is_file:
+                # Check if filename matches search term
+                if search and search.lower() not in name.lower():
+                    continue
+                
+                # Check image filter
+                if img_only and not is_image_file(name):
+                    continue
+                
+                # File passed all filters
+                filtered.append(path)
+            
+            # Handle directories
+            elif is_dir:
+                # For directories, we always include them if they pass basic filters
+                # The user can expand them to see their contents
+                filtered.append(path)
+
+        return filtered
 
 class FileBrowserModal(ModalScreen[Optional[str]]):
     """Enhanced file browser with search, filtering, and GIF animation."""
+    
+    _images_only = reactive(False)  # Add reactive state for filter
     
     CSS = """
     FileBrowserModal {
@@ -560,7 +706,44 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
     #search_container {
         width: 100%;
         height: 3;
+        layout: horizontal;
         margin: 1 0;
+    }
+    
+    #search_input {
+        width: 1fr;
+        margin-right: 1;
+    }
+    
+    #filter_images_btn, #show_all_btn {
+        width: 12;
+        min-width: 12;
+        margin: 0 1;
+    }
+    
+    /* Better visual indicators for filter buttons */
+    #filter_images_btn.success {
+        background: $success;
+        color: $text;
+        border: thick $success;
+    }
+    
+    #show_all_btn.success {
+        background: $success;
+        color: $text;
+        border: thick $success;
+    }
+    
+    #filter_images_btn.primary {
+        background: $primary;
+        color: $text;
+        border: thick $primary;
+    }
+    
+    #show_all_btn.default {
+        background: $surface;
+        color: $text-muted;
+        border: thick $surface;
     }
     
     #directory_tree {
@@ -615,11 +798,6 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
     Button:first-child {
         margin-left: 0;
     }
-    
-    #filter_images_btn, #show_all_btn {
-        min-width: 16;
-        width: auto;
-    }
     """
     
     def __init__(self, title: str = "📁 Sélectionner un fichier"):
@@ -638,12 +816,12 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
             # Search and filter controls
             with Horizontal(id="search_container"):
                 yield Input(placeholder="🔍 Rechercher...", id="search_input")
-                yield Button("🌄 Images", id="filter_images_btn", variant="primary")
-                yield Button("📁 Tous", id="show_all_btn", variant="default")
+                yield Button("🌄 Images", id="filter_images_btn", variant="default")
+                yield Button("📁 Tous", id="show_all_btn", variant="success")
             
             # Main browser area with tree and preview
             with Horizontal(id="main_browser_area"):
-                yield FilteredDirectoryTree("./", id="directory_tree")
+                yield SearchableDirectoryTree("./", id="directory_tree")
                 
                 with Container(id="preview_container"):
                     yield Label("🔍 Aperçu", id="preview_title")
@@ -672,12 +850,7 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
         if event.input.id == "search_input":
             search_term = event.input.value
             tree = self.query_one("#directory_tree")
-            
-            # Get current filter state
-            filter_images_btn = self.query_one("#filter_images_btn")
-            image_filter = filter_images_btn.variant == "success"
-            
-            tree.update_filters(search_term, image_filter)
+            tree.set_filters(search=search_term)
     
     def on_directory_tree_file_selected(self, event) -> None:
         """Handle file/directory selection."""
@@ -703,7 +876,7 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
             
             # Get file icon based on type
             if is_image_file(filename):
-                icon = "🖼️"
+                icon = "🌄"
             elif file_type.startswith("text/"):
                 icon = "📄"
             elif file_type.startswith("video/"):
@@ -748,38 +921,38 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
             preview_content.update(f"❌ Erreur d'aperçu: {e}")
     
     def preview_image(self, file_path: str, preview_content):
-        """Preview static image."""
+        """Preview static images (PNG, JPG, …, SVG if rasterisable)."""
         try:
-            # Create a smaller preview image
             with Image.open(file_path) as img:
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
-                
-                # Small preview size for browser
-                preview_width, preview_height = 25, 15
-                img_width, img_height = img.size
-                aspect_ratio = img_width / img_height
-                
-                if aspect_ratio > preview_width / preview_height:
-                    new_width = preview_width
-                    new_height = int(new_width / aspect_ratio)
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+
+                # Resize for preview box
+                preview_w, preview_h = 25, 15
+                w, h = img.size
+                r = w / h
+                if r > preview_w / preview_h:
+                    new_w, new_h = preview_w, int(preview_w / r)
                 else:
-                    new_height = preview_height
-                    new_width = int(new_height * aspect_ratio)
-                
-                preview_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                pixels = Pixels.from_image(preview_img)
-                
-                # Add image info
+                    new_h, new_w = preview_h, int(preview_h * r)
+                img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+                ascii_preview = self.image_to_ascii(img)
+
+            size_str = format_file_size(os.path.getsize(file_path))
+            info = f"🌄 {os.path.basename(file_path)}\n📏 {size_str} - {w}×{h}\n\n"
+            preview_content.update(info + ascii_preview)
+        except (OSError, Image.UnidentifiedImageError):
+            # not rasterisable – just show raw XML for SVG
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    xml = f.read(800)
                 size_str = format_file_size(os.path.getsize(file_path))
-                info_text = f"🖼️ {os.path.basename(file_path)}\n📏 {size_str} - {img_width}x{img_height}\n\n"
-                
-                preview_content.update(info_text)
-                # Note: In a real implementation, we'd need to handle Pixels objects differently
-                # For now, show text description
-                
+                preview_content.update(f"🖼️ SVG (non-rasterisable)\n📏 {size_str}\n\n{xml[:800]}…")
+            except Exception:
+                preview_content.update(f"🌄 Image\n❌ Aperçu impossible")
         except Exception as e:
-            preview_content.update(f"🖼️ Image\n❌ Erreur d'aperçu: {e}")
+            preview_content.update(f"🌄 Image\n❌ Aperçu impossible : {e}")
     
     def preview_gif(self, file_path: str, preview_content):
         """Preview animated GIF with frame cycling."""
@@ -830,7 +1003,7 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
     def start_gif_animation(self, preview_content):
         """Start GIF frame animation."""
         if self.gif_frames:
-            self.gif_timer = self.set_interval(0.5, self.animate_gif_frame, preview_content)
+            self.gif_timer = self.set_interval(0.5, lambda: self.animate_gif_frame(preview_content))
     
     def animate_gif_frame(self, preview_content):
         """Animate to next GIF frame."""
@@ -930,38 +1103,42 @@ class FileBrowserModal(ModalScreen[Optional[str]]):
             self.stop_gif_animation()  # Clean up before closing
             self.dismiss(None)
         elif button_id == "filter_images_btn":
-            # Toggle image filter
+            # Toggle image filter using reactive state
+            self._images_only = not self._images_only
             tree = self.query_one("#directory_tree")
-            search_input = self.query_one("#search_input")
             
-            # Toggle button state
-            if event.button.variant == "primary":
-                event.button.variant = "success"
-                event.button.label = "🌄 Images "
-                image_filter = True
-            else:
-                event.button.variant = "primary"
-                event.button.label = "🌄 Images "
-                image_filter = False
-            
-            # Update show all button
+            # Update button states with better visual feedback
+            filter_btn = event.button
             show_all_btn = self.query_one("#show_all_btn")
-            show_all_btn.variant = "default" if image_filter else "success"
             
-            tree.update_filters(search_input.value, image_filter)
+            if self._images_only:
+                filter_btn.variant = "success"
+                filter_btn.label = "🌄 Images ✓"
+                show_all_btn.variant = "default"
+                show_all_btn.label = "📁 Tous"
+            else:
+                filter_btn.variant = "default"
+                filter_btn.label = "🌄 Images"
+                show_all_btn.variant = "success"
+                show_all_btn.label = "📁 Tous"
+            
+            tree.set_filters(images_only=self._images_only)
         elif button_id == "show_all_btn":
-            # Show all files
-            tree = self.query_one("#directory_tree")
-            search_input = self.query_one("#search_input")
-            
-            # Reset buttons
-            filter_btn = self.query_one("#filter_images_btn")
-            filter_btn.variant = "primary"
-            filter_btn.label = "🌄 Images "
-            
-            event.button.variant = "success"
-            
-            tree.update_filters(search_input.value, False)
+            # Show all files using reactive state
+            if self._images_only:          # <- only do work if the state changes
+                self._images_only = False
+                tree = self.query_one("#directory_tree")
+                
+                # Update button states with better visual feedback
+                show_all_btn = event.button
+                filter_btn = self.query_one("#filter_images_btn")
+                
+                show_all_btn.variant = "success"
+                show_all_btn.label = "📁 Tous"
+                filter_btn.variant = "default"
+                filter_btn.label = "🌄 Images"
+                
+                tree.set_filters(images_only=False)
 
 class ContactManagerModal(ModalScreen[None]):
     """Enhanced modal for managing contacts and groups with quick connect."""
@@ -1097,19 +1274,19 @@ class ContactManagerModal(ModalScreen[None]):
             
             # Form area (dynamic based on tab)
             with Container(id="form_area"):
-                with Horizontal(classes="form_row"):
+                with Horizontal(classes="form_row", id="form_row1"):
                     yield Label("Nom:", id="form_label1", classes="form_label")
                     yield Input(placeholder="Nom", id="form_input1", classes="form_input")
                 
-                with Horizontal(classes="form_row"):
+                with Horizontal(classes="form_row", id="form_row2"):
                     yield Label("IP:", id="form_label2", classes="form_label")
                     yield Input(placeholder="192.168.1.100", id="form_input2", classes="form_input")
                 
-                with Horizontal(classes="form_row"):
+                with Horizontal(classes="form_row", id="form_row3"):
                     yield Label("Port:", id="form_label3", classes="form_label")
                     yield Input(placeholder="8765", id="form_input3", classes="form_input")
                 
-                with Horizontal(classes="form_row"):
+                with Horizontal(classes="form_row", id="form_row4"):
                     yield Label("Notes:", id="form_label4", classes="form_label")
                     yield Input(placeholder="Notes", id="form_input4", classes="form_input")
             
@@ -1153,6 +1330,10 @@ class ContactManagerModal(ModalScreen[None]):
         """Show contacts management."""
         content = self.query_one("#main_content")
         
+        # Show all form rows for contacts
+        for row_id in ["form_row1", "form_row2", "form_row3", "form_row4"]:
+            self.query_one(f"#{row_id}").styles.display = "block"
+        
         # Update form labels
         self.query_one("#form_label1").update("Nom:")
         self.query_one("#form_label2").update("IP:")
@@ -1192,11 +1373,16 @@ class ContactManagerModal(ModalScreen[None]):
         """Show groups management."""
         content = self.query_one("#main_content")
         
+        # Show only needed form rows for groups
+        for row_id in ["form_row1", "form_row2", "form_row3"]:
+            self.query_one(f"#{row_id}").styles.display = "block"
+        # Hide unused row
+        self.query_one("#form_row4").styles.display = "none"
+        
         # Update form labels for groups
         self.query_one("#form_label1").update("Nom Groupe:")
         self.query_one("#form_label2").update("Contacts:")
         self.query_one("#form_label3").update("Description:")
-        self.query_one("#form_label4").update("")
         
         # Update placeholders
         self.query_one("#form_input1").placeholder = "Nom du groupe"
@@ -1222,6 +1408,12 @@ class ContactManagerModal(ModalScreen[None]):
     def show_quick_connect_tab(self):
         """Show quick connect options."""
         content = self.query_one("#main_content")
+        
+        # Show only the first form row for quick connect
+        self.query_one("#form_row1").styles.display = "block"
+        # Hide unused rows
+        for row_id in ["form_row2", "form_row3", "form_row4"]:
+            self.query_one(f"#{row_id}").styles.display = "none"
         
         # Show form for quick connect (for name input)
         self.query_one("#form_area").styles.display = "block"
@@ -1428,6 +1620,10 @@ class ContactManagerModal(ModalScreen[None]):
             self.notify(f"Groupe '{name}' non trouvé", severity="error")
             return
         
+        # Load group conversation history
+        app_state.load_conversation(f"group_{name}")
+        self.app.chat_view.load_conversation_history()
+        
         # Connect to all contacts in the group
         connected_count = 0
         for contact_name in group.contacts:
@@ -1449,6 +1645,11 @@ class ContactManagerModal(ModalScreen[None]):
         # Try to connect as contact first
         if name in app_state.contacts:
             contact = app_state.contacts[name]
+            
+            # Load contact conversation history
+            app_state.load_conversation(contact.name)
+            self.app.chat_view.load_conversation_history()
+            
             self.app.connect_to_contact(contact)
             self.notify(f"Connexion au contact '{name}' en cours...", severity="information")
             self.dismiss()
@@ -1457,6 +1658,11 @@ class ContactManagerModal(ModalScreen[None]):
         # Try to connect as group
         if name in app_state.groups:
             group = app_state.groups[name]
+            
+            # Load group conversation history
+            app_state.load_conversation(f"group_{name}")
+            self.app.chat_view.load_conversation_history()
+            
             connected_count = 0
             for contact_name in group.contacts:
                 contact = app_state.contacts.get(contact_name)
@@ -1495,7 +1701,7 @@ class FileShareModal(ModalScreen[Optional[str]]):
     
     #file_dialog {
         width: 90%;
-        height: 80%;
+        height: 100%;
         max-width: 100;
         max-height: 30;
         border: thick $primary 80%;
@@ -1540,6 +1746,7 @@ class FileShareModal(ModalScreen[Optional[str]]):
     def compose(self) -> ComposeResult:
         with Container(id="file_dialog"):
             yield Label("📎 Partage de fichier", id="title")
+            
             yield Input(
                 placeholder="Chemin du fichier ou glissez-déposez...",
                 id="file_path_input"
@@ -1570,6 +1777,14 @@ class FileShareModal(ModalScreen[Optional[str]]):
         if event.input.id == "file_path_input":
             self.update_preview(event.input.value.strip())
     
+    def on_file_drop_dropped(self, message: FileDrop.Dropped) -> None:
+        """Handle file drop events."""
+        if message.filepaths:
+            # Use first file only
+            file_path = message.filepaths[0]
+            self.query_one("#file_path_input").value = file_path
+            self.update_preview(file_path)
+    
     def update_preview(self, file_path: str):
         """Update file preview and warnings."""
         preview_content = self.query_one("#preview_content")
@@ -1591,28 +1806,28 @@ class FileShareModal(ModalScreen[Optional[str]]):
             
             # Create preview
             preview_lines = [
-                f"📎 **Fichier**: {filename}",
-                f"📏 **Taille**: {size_str}",
-                f"🏷️ **Type**: {file_type}",
-                f"🔐 **Hash**: {file_hash[:16]}...",
+                f"📎 Fichier: {filename}",
+                f"📏 Taille: {size_str}",
+                f"🔖 Type: {file_type}",
+                f"🔐 Hash: {file_hash[:16]}...",
                 ""
             ]
             
             # Add type-specific preview
             if is_image_file(filename):
-                preview_lines.append("🖼️ **Type**: Image - Aperçu sera affiché dans le chat")
+                preview_lines.append("🌄 Type: Image - Aperçu sera affiché dans le chat")
             elif file_type.startswith("text/") and file_size < 1024 * 10:  # Small text files
                 try:
                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read(500)  # First 500 chars
                         preview_lines.extend([
-                            "📄 **Aperçu du texte**:",
+                            "📄 Aperçu du texte:",
                             content[:200] + ("..." if len(content) > 200 else "")
                         ])
                 except:
-                    preview_lines.append("📄 **Fichier texte** (aperçu non disponible)")
+                    preview_lines.append("📄 Fichier texte (aperçu non disponible)")
             else:
-                preview_lines.append(f"📎 **Fichier binaire** - Sera envoyé tel quel")
+                preview_lines.append(f"📎 Fichier binaire - Sera envoyé tel quel")
             
             preview_content.update("\n".join(preview_lines))
             
@@ -1675,7 +1890,7 @@ class DownloadManagerModal(ModalScreen[None]):
         padding: 1 2;
     }
     
-    #download_list {
+    #download_table {
         width: 100%;
         height: 18;
         border: solid $primary;
@@ -1705,64 +1920,91 @@ class DownloadManagerModal(ModalScreen[None]):
         min-width: 18;
         width: auto;
     }
+    
+    #empty_message {
+        width: 100%;
+        height: auto;
+        color: $text-muted;
+        text-align: center;
+        padding: 2;
+        display: none;
+    }
     """
     
     def compose(self) -> ComposeResult:
         with Container(id="download_dialog"):
             yield Label("📥 Gestionnaire de téléchargements", id="download_title")
             
-            yield ScrollableContainer(
-                Static("Chargement des téléchargements...", id="download_content"),
-                id="download_list"
-            )
+            yield DataTable(id="download_table")
+            yield Label("", id="empty_message")  # Message when no files available
             
             with Horizontal(id="download_buttons"):
                 yield Button("📂 Ouvrir dossier", id="open_folder_btn", variant="primary")
+                yield Button("📥 Télécharger", id="download_btn", variant="success")
                 yield Button("❌ Fermer", id="close_btn", variant="default")
     
     def on_mount(self) -> None:
+        self.files = []
         self.refresh_downloads()
+        self.query_one("#download_table").focus()
     
     def on_key(self, event) -> None:
         """Handle key presses in download manager."""
         if event.key == "escape":
             self.dismiss()
+        elif event.key == "enter":
+            # Alternative way to download with Enter key
+            self.download_file()
+        elif event.key in ["up", "down"]:
+            # Let the table handle arrow keys naturally
+            pass
+    
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in the data table."""
+        # We don't need to track selection manually since we use cursor_row
+        pass
     
     def refresh_downloads(self):
         """Refresh the downloads list."""
-        content = self.query_one("#download_content")
+        dt = self.query_one("#download_table", DataTable)
+        dt.clear()
+        dt.add_columns("Nom", "Taille", "Type", "Date", "Statut")
         
-        # Find files in conversation
-        files = []
+        self.files.clear()
         for msg in app_state.current_conversation:
             if msg.message_type == "file" and msg.file_info:
-                files.append((msg, msg.file_info))
+                fi = msg.file_info
+                self.files.append((msg, fi))
+                try:
+                    date_str = datetime.fromisoformat(msg.timestamp).strftime("%d/%m %H:%M")
+                except:
+                    date_str = msg.timestamp[:16] if len(msg.timestamp) > 16 else msg.timestamp
+                
+                dt.add_row(
+                    fi.filename,
+                    format_file_size(fi.file_size),
+                    fi.file_type.split("/")[0].title(),
+                    date_str,
+                    "✅ Disponible" if fi.download_available else "❌ Expiré",
+                    key=str(len(self.files) - 1),
+                )
         
-        if not files:
-            content.update("📭 Aucun fichier disponible en téléchargement.\n\nLes fichiers partagés dans la conversation apparaîtront ici.")
-            return
-        
-        download_text = "📥 Fichiers disponibles:\n\n"
-        for i, (msg, file_info) in enumerate(files):
-            status = "✅ Disponible" if file_info.download_available else "❌ Expiré"
-            download_text += f"📎 {file_info.filename}\n"
-            download_text += f"   👤 Expéditeur: {msg.sender}\n"
-            download_text += f"   📏 Taille: {format_file_size(file_info.file_size)}\n"
-            download_text += f"   🗂️ Type: {file_info.file_type.split('/')[0].title()}\n"
-            try:
-                download_text += f"   🕒 Date: {datetime.fromisoformat(msg.timestamp).strftime('%d/%m %H:%M')}\n"
-            except:
-                download_text += f"   🕒 Date: {msg.timestamp}\n"
-            download_text += f"   📊 Statut: {status}\n"
-            download_text += "\n"
-        
-        content.update(download_text)
+        # Update empty message
+        empty_msg = self.query_one("#empty_message")
+        if not self.files:
+            empty_msg.update("📋 Aucun fichier disponible dans la conversation actuelle.\nLes fichiers partagés apparaîtront ici.")
+            empty_msg.styles.display = "block"
+        else:
+            empty_msg.update("")
+            empty_msg.styles.display = "none"
     
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
         
         if button_id == "open_folder_btn":
             self.open_downloads_folder()
+        elif button_id == "download_btn":
+            self.download_file()
         elif button_id == "close_btn":
             self.dismiss()
     
@@ -1783,12 +2025,68 @@ class DownloadManagerModal(ModalScreen[None]):
             self.notify("Dossier de téléchargements ouvert", severity="success")
         except Exception as e:
             self.notify(f"Impossible d'ouvrir le dossier: {e}", severity="error")
+    
+    def download_file(self):
+        """Download the selected file from the list."""
+        if not self.files:
+            self.notify("Aucun fichier disponible à télécharger", severity="warning")
+            return
+        
+        # Simple approach: use cursor_row directly as index into self.files
+        table = self.query_one("#download_table")
+        cursor_row = getattr(table, 'cursor_row', None)
+        
+        if cursor_row is None:
+            self.notify("Sélectionnez d'abord un fichier dans la liste", severity="warning")
+            return
+            
+        if cursor_row >= len(self.files):
+            self.notify("Fichier sélectionné invalide", severity="error")
+            return
+            
+        _, fi = self.files[cursor_row]
+        
+        if not fi.download_available:
+            self.notify("Ce fichier n'est plus disponible", severity="warning")
+            return
+        
+        try:
+            from pathlib import Path
+            
+            # Look for the file in temp folder with any prefix that matches
+            temp_path = Path(app_state.temp_folder)
+            matches = list(temp_path.glob(f"received_*_{fi.filename}"))
+            
+            if not matches:
+                self.notify("❌ Fichier source introuvable (il n'a peut-être pas encore été reçu).", severity="error")
+                return
+            
+            src = matches[0]  # Use first match
+            dst = Path(app_state.downloads_folder) / fi.filename
+            
+            # Handle filename conflicts
+            counter = 1
+            original_dst = dst
+            while dst.exists():
+                stem = original_dst.stem
+                suffix = original_dst.suffix
+                dst = original_dst.parent / f"{stem}_{counter}{suffix}"
+                counter += 1
+            
+            shutil.copy(src, dst)
+            self.notify(f"✅ {fi.filename} enregistré dans {app_state.downloads_folder}", severity="success")
+            
+        except Exception as e:
+            self.notify(f"❌ Erreur de téléchargement: {e}", severity="error")
 
 # ────────────────────────────── widgets ──────────────────────────────
 class ChatView(ScrollableContainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.messages = []
+        self.gif_timers = {}  # Track GIF animations by message index
+        self.gif_frames = {}  # Store GIF frames by message index
+        self.gif_frame_indices = {}  # Track current frame by message index
 
     def add_message(self, sender, message, timestamp=None, message_type="text", file_info=None, is_image=False):
         """Add a message to the chat view."""
@@ -1815,7 +2113,7 @@ class ChatView(ScrollableContainer):
             if file_info:
                 size_str = format_file_size(file_info.file_size)
                 if is_image_file(file_info.filename):
-                    icon = "🖼️"
+                    icon = "🌄"
                 elif file_info.file_type.startswith("text/"):
                     icon = "📄"
                 elif file_info.file_type.startswith("video/"):
@@ -1827,7 +2125,7 @@ class ChatView(ScrollableContainer):
                 
                 msg.append(f"{icon} {file_info.filename} ({size_str})", style="bold")
                 if sender != app_state.username:
-                    msg.append(" - Cliquez pour télécharger", style="italic blue")
+                    msg.append(" - F2 pour télécharger", style="italic dim")
             else:
                 msg.append("[Fichier partagé]", style="italic")
         elif message_type == "image":
@@ -1869,13 +2167,58 @@ class ChatView(ScrollableContainer):
     def update_image_display(self, display_content: Union[Pixels, str]):
         """Update the last image message with processed content."""
         if self.messages and len(self.messages) >= 2:
+            message_index = len(self.messages) - 1
+            
             if isinstance(display_content, Pixels):
-                self.messages[-1] = display_content
+                self.messages[message_index] = display_content
+            elif isinstance(display_content, list):
+                # Handle GIF frames
+                self.gif_frames[message_index] = display_content
+                self.gif_frame_indices[message_index] = 0
+                if display_content:
+                    self.messages[message_index] = display_content[0]
+                    self.start_gif_animation(message_index)
             else:
-                self.messages[-1] = Text(str(display_content), style="red")
+                self.messages[message_index] = Text(str(display_content), style="red")
             
             self.update_messages()
             self.scroll_end()
+    
+    def start_gif_animation(self, message_index: int):
+        """Start GIF animation for a specific message."""
+        if message_index in self.gif_frames and self.gif_frames[message_index]:
+            # Stop any existing timer for this message
+            if message_index in self.gif_timers:
+                self.gif_timers[message_index].stop()
+            
+            # Start new animation timer
+            self.gif_timers[message_index] = self.set_interval(
+                0.5, lambda: self.animate_gif_frame(message_index)
+            )
+    
+    def animate_gif_frame(self, message_index: int):
+        """Animate to next GIF frame."""
+        if (message_index in self.gif_frames and 
+            message_index in self.gif_frame_indices and
+            self.gif_frames[message_index]):
+            
+            frames = self.gif_frames[message_index]
+            current_index = self.gif_frame_indices[message_index]
+            
+            # Move to next frame
+            next_index = (current_index + 1) % len(frames)
+            self.gif_frame_indices[message_index] = next_index
+            
+            # Update the message with new frame
+            if message_index < len(self.messages):
+                self.messages[message_index] = frames[next_index]
+                self.update_messages()
+    
+    def stop_gif_animations(self):
+        """Stop all GIF animations."""
+        for timer in self.gif_timers.values():
+            timer.stop()
+        self.gif_timers.clear()
 
     def update_file_display(self, file_info: FileMessage, download_link: bool = True):
         """Update file message with download info."""
@@ -2060,10 +2403,10 @@ class EncodHexApp(App):
         Binding("ctrl+c", "quit", "Quitter", show=True),
         Binding("ctrl+q", "quit", "Quitter", show=True),
         Binding("ctrl+r", "step_back_or_reset", "← Retour/Config", show=True),
+        Binding("f1", "manage_contacts", "👥 Contacts", show=True),
+        Binding("f2", "manage_downloads", "📥 Téléchargements", show=True),
+        Binding("f3", "load_conversation", "📜 Historique", show=True),
         Binding("f5", "select_file", "📎 Fichier", show=True),
-        Binding("ctrl+k", "manage_contacts", "👥 Contacts", show=True),
-        Binding("ctrl+d", "manage_downloads", "📥 Téléchargements", show=True),
-        Binding("ctrl+h", "load_conversation", "📜 Historique", show=True),
     ]
 
     app_state_ui = reactive("welcome", bindings=True)
@@ -2153,14 +2496,17 @@ class EncodHexApp(App):
     
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Control binding visibility based on current state."""
-        # Masquer (=False) quand l'action n'a pas de sens dans l'écran courant
-        if action in {"select_file", "manage_downloads", "load_conversation"}:
-            return self.app_state_ui == "conversation"
+        # Show contacts binding in config screens and conversation
         if action == "manage_contacts":
             return self.app_state_ui.startswith("setup_") or self.app_state_ui == "conversation"
+        # Show file, downloads, and history only in conversation
+        if action in {"select_file", "manage_downloads", "load_conversation"}:
+            return self.app_state_ui == "conversation"
+        # Show step back in config screens and conversation
         if action == "step_back_or_reset":
             return self.app_state_ui.startswith("setup_") or self.app_state_ui == "conversation"
-        return True  # visible partout ailleurs (notamment quit)
+        # Show quit everywhere
+        return True
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, id="header")
@@ -3287,8 +3633,11 @@ class EncodHexApp(App):
                 display_content = await process_image_for_display_async(file_path)
                 self.chat_view.update_image_display(display_content)
                 
-                # Send as image
+                # Send as image for preview
                 await self.broadcast_message_to_peers(image_path=file_path)
+                
+                # Also send as file for full-quality download
+                await self.broadcast_message_to_peers(file_path=file_path)
             else:
                 # Handle as regular file
                 file_info = FileMessage(
@@ -3318,6 +3667,10 @@ class EncodHexApp(App):
         """Connect to a contact from the contact manager."""
         try:
             self.notify(f"Connexion à {contact.name} ({contact.ip}:{contact.port})...", severity="information")
+            
+            # Load conversation history for this contact
+            app_state.load_conversation(contact.name)
+            self.chat_view.load_conversation_history()
             
             # Create connection task
             asyncio.create_task(self.establish_full_peer_connection(contact.ip, contact.port))
@@ -3441,39 +3794,47 @@ class EncodHexApp(App):
         self.exit()
 
     async def on_key(self, event) -> None:
-        """Handle key presses with state-specific context awareness."""
+        """Handle global key events."""
         key_str = str(event.key)
         
         # Global shortcuts (available everywhere)
         if key_str in ["ctrl+c", "ctrl+q"]:
             await self.action_quit()
             return
-        elif key_str == "ctrl+\\": # Palette shortcut
-            # Let Textual handle this
-            return
         
-        # State-specific shortcuts
-        if self.app_state_ui == "welcome":
-            # Welcome screen: only quit and palette
-            pass  # No additional shortcuts
-            
-        elif self.app_state_ui in ["setup_username", "setup_port", "setup_mode", "setup_target_ip", "setup_target_port"]:
-            # Configuration screens: quit, step back, and palette
-            if key_str == "ctrl+r":
-                await self.action_step_back()
-                
-        elif self.app_state_ui == "conversation":
-            # Conversation: all shortcuts available
-            if key_str == "f5":
-                await self.action_select_file()
-            elif key_str == "ctrl+k":
-                await self.action_manage_contacts()
-            elif key_str == "ctrl+d":
-                await self.action_manage_downloads()
-            elif key_str == "ctrl+h":
-                await self.action_load_conversation()
-            elif key_str == "ctrl+r":
+        # F-key shortcuts that work everywhere applicable
+        if key_str == "f1":
+            await self.action_manage_contacts()
+        elif key_str == "f2":
+            await self.action_manage_downloads()
+        elif key_str == "f3":
+            await self.action_load_conversation()
+        elif key_str == "f5":
+            await self.action_select_file()
+        elif key_str == "ctrl+r":
+            if self.app_state_ui == "conversation":
                 await self.action_reset_config()
+            elif self.app_state_ui.startswith("setup_"):
+                await self.action_step_back()
+
+    async def on_paste(self, event) -> None:
+        """Handle paste events for drag and drop functionality."""
+        path = event.text.strip()
+        # Windows drops often wrap the path in quotes – strip them
+        if path.startswith('"') and path.endswith('"'):
+            path = path[1:-1]
+
+        if os.path.isfile(path):
+            event.stop()   # don't let the path get typed into the input
+            await self.send_selected_file(path)
+        else:
+            # fall back: insert the text in the input field
+            try:
+                input_box = self.query_one("#user-input", ChatInput)
+                input_box.insert_text_at_cursor(event.text)
+            except:
+                # If input not found or not focused, just ignore
+                pass
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         """Handle button presses."""
